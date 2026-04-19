@@ -230,6 +230,10 @@ __global__ void gemm_int4_kernel(
      uint8_t *sA1 = smem + tileA + tileB, *sB1 = sA1 + tileA;
      uint8_t *sA[2] = {sA0, sA1};
      uint8_t *sB[2] = {sB0, sB1};
+     // Step 1 opt: one coalesced load of all weight scales for columns [bn, bn+BLOCK_N) per K-tile
+     const int smem_ab_bytes = 2 * (tileA + tileB);
+     half* __restrict__ scale_smem =
+         reinterpret_cast<half*>(smem + smem_ab_bytes);
  
      // FP32 accumulators: [n_tile][mma_half=0,1][4 values]
      // mma_half 0 = columns 0-7, mma_half 1 = columns 8-15
@@ -271,6 +275,14 @@ __global__ void gemm_int4_kernel(
  
          // Group index for scales
         int g = (kt * BLOCK_K) / GROUP_SIZE;
+
+         if (tid < BLOCK_N) {
+             int col = bn + tid;
+             scale_smem[tid] = (col < N)
+                 ? scales_B[(size_t)col * num_groups + g]
+                 : __float2half(0.f);
+         }
+         __syncthreads();
  
          // Activation scales for this warp's rows
          int m_lo = bm + warpId * WARP_M + laneId / 4;
@@ -302,10 +314,10 @@ __global__ void gemm_int4_kernel(
              int c1 = c0 + 1;
              int c2 = c0 + 8;
              int c3 = c2 + 1;
-             float sb0 = (c0 < N) ? __half2float(scales_B[c0 * num_groups + g]) : 0.f;
-             float sb1 = (c1 < N) ? __half2float(scales_B[c1 * num_groups + g]) : 0.f;
-             float sb2 = (c2 < N) ? __half2float(scales_B[c2 * num_groups + g]) : 0.f;
-             float sb3 = (c3 < N) ? __half2float(scales_B[c3 * num_groups + g]) : 0.f;
+             float sb0 = (c0 < N) ? __half2float(scale_smem[c0 - bn]) : 0.f;
+             float sb1 = (c1 < N) ? __half2float(scale_smem[c1 - bn]) : 0.f;
+             float sb2 = (c2 < N) ? __half2float(scale_smem[c2 - bn]) : 0.f;
+             float sb3 = (c3 < N) ? __half2float(scale_smem[c3 - bn]) : 0.f;
  
              acc[nt][0][0] += (float)p0[0] * sa_lo * sb0;
              acc[nt][0][1] += (float)p0[1] * sa_lo * sb1;
@@ -353,7 +365,8 @@ inline void launch_gemm_int4_kernel(
     static_assert(K % BLOCK_K == 0, "K must be divisible by BLOCK_K");
     dim3 grid((N + BLOCK_N - 1) / BLOCK_N, (M + BLOCK_M - 1) / BLOCK_M);
     dim3 block(WARP_SZ * NUM_WARPS);
-    int smem = 2 * (BLOCK_M * SMEM_STRIDE + BLOCK_N * SMEM_STRIDE);
+    int smem = 2 * (BLOCK_M * SMEM_STRIDE + BLOCK_N * SMEM_STRIDE)
+        + BLOCK_N * (int)sizeof(half);
     gemm_int4_kernel<M, N, K, GROUP_SIZE><<<grid, block, smem, at::cuda::getCurrentCUDAStream()>>>(
         A_packed, B_packed, scales_A, scales_B, C
     );
